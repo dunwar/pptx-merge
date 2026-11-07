@@ -1,0 +1,28 @@
+{
+  "name": "pptx-merge",
+  "version": "1.0.0",
+  "description": "Merge and compress PowerPoint (.pptx) files entirely in the browser - no uploads, no server. OPC/ZIP surgery with JSZip.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "tsx test/merge.test.mjs"
+  },
+  "keywords": [
+    "pptx",
+    "powerpoint",
+    "merge",
+    "compress",
+    "browser",
+    "client-side",
+    "opc",
+    "office-open-xml"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "jszip": "^3.10.2"
+  },
+  "devDependencies": {
+    "pptxgenjs": "^4.0.1",
+    "tsx": "^4.23.15"
+  }
+}
