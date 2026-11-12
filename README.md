@@ -1,6 +1,6 @@
 # pptx-merge
 
-<a href="https://aippt.org/?utm_source=badge&utm_medium=referral&utm_campaign=github"><img src="https://aippt.org/badge/badge-light-260x64.svg" alt="AIPPT.org — merge, compress and convert PPT files in your browser" width="260" height="64"></a>
+<a href="https://aippt.org/merge-ppt"><img src="https://aippt.org/badge/badge-light-260x64.svg" alt="AIPPT.org — merge, compress and convert PPT files in your browser" width="260" height="64"></a>
 
 Merge and compress PowerPoint (.pptx) files **entirely in the browser**. Files are processed locally with JSZip — nothing is uploaded to any server. / 浏览器内处理，文件不上传。
 
