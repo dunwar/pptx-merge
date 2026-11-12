@@ -119,6 +119,34 @@ async function verify(mergedBuf, expectedSlides, label) {
       problems.push(`no content type for ${p}`);
   }
 
+  // 3b. known part families must be typed by an Override with the exact
+  // content type — pptxgenjs ships Default Extension="xml", so a prefixed
+  // slide without an Override is retyped application/xml and PowerPoint
+  // repairs it away (merged deck opens with only the first file's slides)
+  const CT_BY_DIR = {
+    'ppt/slides/': 'application/vnd.openxmlformats-officedocument.presentationml.slide+xml',
+    'ppt/slideLayouts/': 'application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml',
+    'ppt/slideMasters/': 'application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml',
+    'ppt/notesSlides/': 'application/vnd.openxmlformats-officedocument.presentationml.notesSlide+xml',
+    'ppt/notesMasters/': 'application/vnd.openxmlformats-officedocument.presentationml.notesMaster+xml',
+    'ppt/theme/': 'application/vnd.openxmlformats-officedocument.theme+xml',
+  };
+  const ctByPart = new Map();
+  for (const m of ctXml.matchAll(/<Override\b[^>]*?\/?>/g))
+    ctByPart.set(
+      (attr(m[0], 'PartName') || '').replace(/^\//, '').toLowerCase(),
+      attr(m[0], 'ContentType')
+    );
+  for (const p of paths) {
+    if (p.endsWith('.rels')) continue;
+    for (const [dir, ct] of Object.entries(CT_BY_DIR)) {
+      if (!p.toLowerCase().startsWith(dir)) continue;
+      const got = ctByPart.get(p.toLowerCase());
+      if (got !== ct)
+        problems.push(`${p} must carry an Override typed ${ct} (got ${got ?? 'only a Default'})`);
+    }
+  }
+
   const bytes = mergedBuf.size ?? mergedBuf.length ?? 0;
   console.log(`[${label}] parts=${paths.length} relsFiles=${relFiles} slides=${sldTags.length} size=${(bytes / 1048576).toFixed(2)}MB`);
   if (problems.length) {

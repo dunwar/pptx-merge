@@ -502,16 +502,22 @@ export async function mergePptxFiles(
         baseZip.file(relsPathOf(np), rewritten);
       }
 
-      // Content types.
-      const ext = extOf(np);
-      if (!ctDefaults.has(ext) && !ctOverrides.has(np.toLowerCase())) {
-        const fromOverride = pack.ctOverrides.get(actual.toLowerCase());
-        if (fromOverride) {
+      // Content types. An Override in the source package must be carried to
+      // the new path even when a Default covers the extension — packages
+      // that ship Default Extension="xml" (pptxgenjs, some WPS decks) would
+      // otherwise retype prefixed slides as application/xml and PowerPoint
+      // repairs them away.
+      const fromOverride = pack.ctOverrides.get(actual.toLowerCase());
+      if (fromOverride) {
+        if (!ctOverrides.has(np.toLowerCase())) {
           ctOverrides.set(np.toLowerCase(), fromOverride);
           ctAdditions.push(
             `<Override PartName="/${np}" ContentType="${fromOverride}"/>`
           );
-        } else {
+        }
+      } else {
+        const ext = extOf(np);
+        if (!ctDefaults.has(ext)) {
           const fromDefault = pack.ctDefaults.get(ext);
           const ct = fromDefault ?? 'application/octet-stream';
           ctDefaults.set(ext, ct);
