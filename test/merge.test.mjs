@@ -57,7 +57,7 @@ async function countSlides(buf) {
   return (xml.match(/<p:sldId\b/g) || []).length;
 }
 
-async function verify(mergedBuf, expectedSlides, label) {
+async function verify(mergedBuf, expectedSlides, label, expectedMasters) {
   const zip = await JSZip.loadAsync(mergedBuf);
   const paths = Object.keys(zip.files).filter((p) => !zip.files[p].dir);
   const lower = new Set(paths.map((p) => p.toLowerCase()));
@@ -87,6 +87,33 @@ async function verify(mergedBuf, expectedSlides, label) {
       if (!lower.has(resolved.toLowerCase()))
         problems.push(`slide target missing: ${resolved}`);
     }
+  }
+
+  // 1b. slide masters (P2-10): every sldMasterId resolves, ids unique and
+  // >= 2147483648, count matches expectation, and every slideMaster part
+  // in the package is registered (bidirectional).
+  const masterTags = [...presXml.matchAll(/<p:sldMasterId\b[^>]*?\/?>/g)].map((m) => m[0]);
+  if (expectedMasters != null && masterTags.length !== expectedMasters)
+    problems.push(`master count ${masterTags.length} != expected ${expectedMasters}`);
+  const masterIdSet = new Set();
+  const masterListed = new Set();
+  for (const tag of masterTags) {
+    const id = Number(attr(tag, 'id'));
+    const rid = attr(tag, 'r:id');
+    if (!(id >= 2147483648)) problems.push(`sldMasterId ${id} below 2147483648`);
+    if (masterIdSet.has(id)) problems.push(`duplicate sldMasterId ${id}`);
+    masterIdSet.add(id);
+    if (!rid || !relIds.has(rid)) problems.push(`sldMasterId ${id} has unresolved ${rid}`);
+    else {
+      const resolved = resolveRel('ppt', relIds.get(rid));
+      if (!lower.has(resolved.toLowerCase()))
+        problems.push(`master target missing: ${resolved}`);
+      masterListed.add(resolved.toLowerCase());
+    }
+  }
+  for (const p of paths) {
+    if (/^ppt\/slidemasters\/[^/]+\.xml$/i.test(p) && !masterListed.has(p.toLowerCase()))
+      problems.push(`slideMaster part not registered: ${p}`);
   }
 
   // 2. every rels file: internal targets resolve
@@ -182,11 +209,13 @@ const expected = perFile.reduce((a, b) => a + b, 0);
 
 // ---- preserve mode ----
 const p1 = await mergePptxFiles(inputs, { mode: 'preserve' });
-await verify(p1.blob, expected, 'preserve');
+// Each pptxgenjs deck has one slide master; preserve registers all
+// three, unify keeps only the first deck's.
+await verify(p1.blob, expected, 'preserve', 3);
 
 // ---- unify mode ----
 const p2 = await mergePptxFiles(inputs, { mode: 'unify', outputName: 'test.pptx' });
-await verify(p2.blob, expected, 'unify');
+await verify(p2.blob, expected, 'unify', 1);
 console.log(`unify result: mismatch=${p2.sizeMismatch} name=${p2.fileName}`);
 
 // ---- error branches ----

@@ -1,5 +1,5 @@
 /**
- * Browser-local PPTX merger.
+ * Browser-local PPTX merger (REQUIREMENTS v0.6 D2).
  *
  * A .pptx is an OPC package: parts + rels + [Content_Types].xml. To merge
  * decks we use deck #1 as the base package and, for every other deck,
@@ -16,7 +16,7 @@
  * - The file never leaves the browser; there is no upload path here.
  *
  * DOM-free by design (regex surgery on XML strings) so the exact same
- * code runs in node for structural tests (test/merge.test.mjs).
+ * code runs in node for structural tests (scripts/test-merge.mjs).
  */
 
 import JSZip from 'jszip';
@@ -43,6 +43,8 @@ export type MergeResult = {
   originalBytes: number;
   mergedBytes: number;
   sizeMismatch: boolean;
+  /** Per-source slide counts, for the result breakdown line (P1-5). */
+  perFile: Array<{ name: string; slides: number }>;
 };
 
 export type MergeErrorCode =
@@ -52,7 +54,9 @@ export type MergeErrorCode =
   | 'ppt'
   | 'encrypted'
   | 'corrupt'
-  | 'no_slides';
+  | 'no_slides'
+  /** Output slide parts / sldIdLst ≠ sum of inputs — never delivered. */
+  | 'count_mismatch';
 
 export class MergeError extends Error {
   code: MergeErrorCode;
@@ -170,6 +174,10 @@ type Package = {
   presRels: Rel[];
   slideTargets: string[]; // actual paths, sldIdLst order
   sldIds: number[];
+  /** Slide masters in sldMasterIdLst order (P2-10 registration). */
+  masterTargets: string[];
+  /** Existing sldMasterId id values, parallel to masterTargets. */
+  masterIds: number[];
   cx: number;
   cy: number;
   notesMasterTargets: string[];
@@ -232,6 +240,22 @@ async function parsePackage(name: string, zip: JSZip): Promise<Package> {
   const cx = Number(szm ? (attrOf(szm[0], 'cx') ?? '0') : '0');
   const cy = Number(szm ? (attrOf(szm[0], 'cy') ?? '0') : '0');
 
+  // Slide masters, in sldMasterIdLst order (that order decides the
+  // default master for new slides, so we preserve it when importing).
+  const masterTargets: string[] = [];
+  const masterIds: number[] = [];
+  for (const m of presXml.matchAll(/<p:sldMasterId\b[^>]*?\/?>/g)) {
+    const rid = attrOf(m[0], 'r:id');
+    const id = Number(attrOf(m[0], 'id') ?? '0');
+    if (!rid) continue;
+    const rel = relById.get(rid);
+    if (!rel || rel.external) continue;
+    const actual = index.get(resolveRel('ppt', rel.target).toLowerCase());
+    if (!actual) continue;
+    masterTargets.push(actual);
+    masterIds.push(id);
+  }
+
   const notesMasterTargets = presRels
     .filter((r) => !r.external && r.type.endsWith('/notesMaster'))
     .map((r) => index.get(resolveRel('ppt', r.target).toLowerCase()))
@@ -262,6 +286,8 @@ async function parsePackage(name: string, zip: JSZip): Promise<Package> {
     presRels,
     slideTargets,
     sldIds,
+    masterTargets,
+    masterIds,
     cx,
     cy,
     notesMasterTargets,
@@ -275,7 +301,12 @@ async function parsePackage(name: string, zip: JSZip): Promise<Package> {
 
 export async function mergePptxFiles(
   files: MergeInput[],
-  opts: { mode?: MergeMode; outputName?: string } = {},
+  opts: {
+    mode?: MergeMode;
+    outputName?: string;
+    /** Scale mismatched slides to the first file's canvas (P1-7). */
+    scaleToFit?: boolean;
+  } = {},
   onProgress?: MergeProgress
 ): Promise<MergeResult> {
   if (files.length < 2) fail('need_two');
@@ -351,6 +382,11 @@ export async function mergePptxFiles(
   }
   let nextSldId = 256;
   for (const id of base.sldIds) if (id >= nextSldId) nextSldId = id + 1;
+  // sldMasterId values live at >= 2147483648 (ST_SlideMasterId); new
+  // masters continue past whatever the base deck already uses.
+  let nextMasterId = 2147483648;
+  for (const id of base.masterIds)
+    if (id >= nextMasterId) nextMasterId = id + 1;
 
   // ---- unify mode: pick base layouts to retarget to ----
   let baseLayouts: { path: string; name: string }[] = [];
@@ -390,6 +426,11 @@ export async function mergePptxFiles(
   );
   const appendRels: string[] = [];
   const appendSldIds: string[] = [];
+  // Master registration is all-or-nothing (rels + sldMasterIdLst entries
+  // are spliced as a pair at commit time) so a degenerate base deck
+  // without a closable sldMasterIdLst can't end up with orphan rels.
+  const masterRels: string[] = [];
+  const appendMasterIds: string[] = [];
 
   // ---- import every non-base deck ----
   for (let fi = 1; fi < packs.length; fi++) {
@@ -457,6 +498,21 @@ export async function mergePptxFiles(
     }
 
     // Copy parts + rewritten rels.
+    // Mixed-size packs (P1-7): optionally rescale each imported slide's
+    // top-level shapes to the first file's canvas so 16:9 content doesn't
+    // overflow a 4:3 deck (and vice versa).
+    const scaleInfo =
+      opts.scaleToFit && (pack.cx !== base.cx || pack.cy !== base.cy)
+        ? (() => {
+            const k = Math.min(base.cx / pack.cx, base.cy / pack.cy);
+            return {
+              k,
+              dx: Math.round((base.cx - pack.cx * k) / 2),
+              dy: Math.round((base.cy - pack.cy * k) / 2),
+            };
+          })()
+        : null;
+
     for (const [lp, npRaw] of rename) {
       const actual = pack.index.get(lp)!;
       let np = npRaw;
@@ -468,7 +524,15 @@ export async function mergePptxFiles(
 
       const entry = pack.zip.file(actual);
       if (!entry) continue;
-      baseZip.file(np, await entry.async('uint8array'));
+      if (scaleInfo && /^ppt\/slides\/[^/]+\.xml$/.test(np)) {
+        const xml = await entry.async('string');
+        baseZip.file(
+          np,
+          scaleSlideXml(xml, scaleInfo.k, scaleInfo.dx, scaleInfo.dy)
+        );
+      } else {
+        baseZip.file(np, await entry.async('uint8array'));
+      }
 
       const relsXml = await readTextAsync(
         pack.zip,
@@ -503,10 +567,9 @@ export async function mergePptxFiles(
       }
 
       // Content types. An Override in the source package must be carried to
-      // the new path even when a Default covers the extension — packages
-      // that ship Default Extension="xml" (pptxgenjs, some WPS decks) would
-      // otherwise retype prefixed slides as application/xml and PowerPoint
-      // repairs them away.
+      // the new path even when a Default covers the extension — pptxgenjs
+      // ships Default Extension="xml", and without the Override PowerPoint
+      // types prefixed slides as application/xml and repairs them away.
       const fromOverride = pack.ctOverrides.get(actual.toLowerCase());
       if (fromOverride) {
         if (!ctOverrides.has(np.toLowerCase())) {
@@ -537,22 +600,70 @@ export async function mergePptxFiles(
       nextRid++;
       nextSldId++;
     }
+
+    // Register this deck's slide masters (P2-10). The rels closure copied
+    // them (slide → layout → master → theme), but until they appear in
+    // presentation.xml's sldMasterIdLst PowerPoint ignores the parts and
+    // the imported slides lose their designs. Preserve mode only: unify
+    // retargets every slide to base layouts, so source masters are
+    // neither copied nor wanted. Listed masters keep their source order;
+    // any master the closure found that the source's own list omits is
+    // appended after (defensive, malformed inputs only).
+    if (mode === 'preserve') {
+      const registered = new Set<string>();
+      for (const mp of pack.masterTargets) {
+        const np = rename.get(mp.toLowerCase());
+        if (!np) continue;
+        registered.add(np.toLowerCase());
+        masterRels.push(
+          `<Relationship Id="rId${nextRid}" Type="${REL_SLIDE_MASTER}" Target="${relTarget('ppt', np)}"/>`
+        );
+        appendMasterIds.push(
+          `<p:sldMasterId id="${nextMasterId}" r:id="rId${nextRid}"/>`
+        );
+        nextRid++;
+        nextMasterId++;
+      }
+      for (const [lp, np] of rename) {
+        if (registered.has(np.toLowerCase())) continue;
+        if (!/^ppt\/slidemasters\/[^/]+\.xml$/.test(lp)) continue;
+        registered.add(np.toLowerCase());
+        masterRels.push(
+          `<Relationship Id="rId${nextRid}" Type="${REL_SLIDE_MASTER}" Target="${relTarget('ppt', np)}"/>`
+        );
+        appendMasterIds.push(
+          `<p:sldMasterId id="${nextMasterId}" r:id="rId${nextRid}"/>`
+        );
+        nextRid++;
+        nextMasterId++;
+      }
+    }
   }
 
   // ---- commit presentation edits ----
   if (!base.presXml.includes('</p:sldIdLst>')) fail('corrupt', base.name);
-  baseZip.file(
-    'ppt/presentation.xml',
-    base.presXml.replace(
-      '</p:sldIdLst>',
-      `${appendSldIds.join('')}</p:sldIdLst>`
-    )
+  // Splice master registration as a pair (or not at all): a base deck
+  // without a closable sldMasterIdLst is degenerate (every real pptx
+  // has one) — skipping beats corrupting, and masters then behave as
+  // they did before P2-10 (copied but unregistered).
+  const registerMasters =
+    appendMasterIds.length > 0 && base.presXml.includes('</p:sldMasterIdLst>');
+  let finalPresXml = base.presXml.replace(
+    '</p:sldIdLst>',
+    `${appendSldIds.join('')}</p:sldIdLst>`
   );
+  if (registerMasters) {
+    finalPresXml = finalPresXml.replace(
+      '</p:sldMasterIdLst>',
+      `${appendMasterIds.join('')}</p:sldMasterIdLst>`
+    );
+  }
+  baseZip.file('ppt/presentation.xml', finalPresXml);
   baseZip.file(
     'ppt/_rels/presentation.xml.rels',
     base.presRelsXml.replace(
       '</Relationships>',
-      `${appendRels.join('')}</Relationships>`
+      `${[...appendRels, ...(registerMasters ? masterRels : [])].join('')}</Relationships>`
     )
   );
   if (ctAdditions.length) {
@@ -565,6 +676,54 @@ export async function mergePptxFiles(
   const slideCount =
     base.slideTargets.length +
     packs.slice(1).reduce((n, p) => n + p.slideTargets.length, 0);
+
+  // ---- zero-silent-loss self-check (P1-5, benchmark Q1) ----
+  // The two historical page-loss incidents (11-07, 11-11) were caught only
+  // by external unpacking. This guard refuses to deliver any package whose
+  // slide parts or sldIdLst entries don't equal the sum of the inputs.
+  {
+    const outSlideParts = Object.keys(baseZip.files).filter(
+      (p) => /^ppt\/slides\/[^/]+\.xml$/.test(p) && !baseZip.files[p].dir
+    ).length;
+    const finalPres = await baseZip
+      .file('ppt/presentation.xml')!
+      .async('string');
+    const sldIds = (finalPres.match(/<p:sldId /g) || []).length;
+    if (outSlideParts !== slideCount || sldIds !== slideCount) {
+      fail('count_mismatch');
+    }
+
+    // Master registration consistency (P2-10): every master WE imported
+    // must be listed in sldMasterIdLst through a resolvable rel, and
+    // every sldMasterId must resolve — the pre-P2-10 silent-unregistered
+    // state is a regression if it ever comes back. The base deck's own
+    // listing is PowerPoint's business, not ours.
+    if (registerMasters) {
+      const relsFinal = parseRels(
+        await baseZip.file('ppt/_rels/presentation.xml.rels')!.async('string')
+      );
+      const relByIdF = new Map(relsFinal.map((r) => [r.id, r]));
+      const listed = new Set<string>();
+      for (const m of finalPres.matchAll(/<p:sldMasterId\b[^>]*?\/?>/g)) {
+        const rid = attrOf(m[0], 'r:id');
+        const rel = rid ? relByIdF.get(rid) : null;
+        if (!rel || rel.external) fail('count_mismatch');
+        listed.add(resolveRel('ppt', rel.target).toLowerCase());
+      }
+      for (const p of Object.keys(baseZip.files)) {
+        if (baseZip.files[p].dir) continue;
+        if (!/^ppt\/slidemasters\/f\d+_[^/]+\.xml$/i.test(p)) continue;
+        if (!listed.has(p.toLowerCase())) fail('count_mismatch');
+      }
+    }
+  }
+
+  const perFile = [
+    { name: files[0].name, slides: base.slideTargets.length },
+    ...packs
+      .slice(1)
+      .map((p) => ({ name: p.name, slides: p.slideTargets.length })),
+  ];
 
   // ---- package ----
   onProgress?.({ step: 'package', current: 0, total: 100 });
@@ -593,12 +752,106 @@ export async function mergePptxFiles(
     originalBytes: total,
     mergedBytes,
     sizeMismatch,
+    perFile,
   };
 }
 
 function relTypeShort(type: string): string {
   const i = type.lastIndexOf('/');
   return i < 0 ? type : type.slice(i + 1);
+}
+
+/**
+ * Rescale a slide's top-level shapes (P1-7). The xfrm scaled is the one
+ * belonging to an element that sits directly in the spTree — including a
+ * top-level group's own xfrm (the group moves as one object). Everything
+ * inside a group keeps its child coordinate space: nested shapes' xfrm
+ * and the group's chOff/chExt are left untouched.
+ */
+export function scaleSlideXml(
+  xml: string,
+  k: number,
+  dx: number,
+  dy: number
+): string {
+  const tokenRe =
+    /<\/?p:(sp|pic|graphicFrame|cxnSp|grpSp)(?:\s[^>]*)?>|<a:xfrm[^>]*>[\s\S]*?<\/a:xfrm>/g;
+  const stack: string[] = []; // open element names
+  const edits: Array<{ start: number; end: number; text: string }> = [];
+  let m: RegExpExecArray | null;
+
+  const scaleBlock = (block: string) =>
+    block
+      .replace(
+        /<a:off x="(-?\d+)" y="(-?\d+)"\s*\/>/,
+        (_t, xs: string, ys: string) =>
+          `<a:off x="${Math.round(Number(xs) * k + dx)}" y="${Math.round(
+            Number(ys) * k + dy
+          )}"/>`
+      )
+      .replace(
+        /<a:ext cx="(\d+)" cy="(\d+)"\s*\/>/,
+        (_t, cxs: string, cys: string) =>
+          `<a:ext cx="${Math.round(Number(cxs) * k)}" cy="${Math.round(
+            Number(cys) * k
+          )}"/>`
+      );
+
+  while ((m = tokenRe.exec(xml))) {
+    const tag = m[0];
+    if (tag.startsWith('<a:xfrm')) {
+      // Scale only when the enclosing element is at spTree level: no grpSp
+      // below it in the stack (the element itself on top doesn't count).
+      const groupsBelow = stack.filter((s) => s === 'grpSp').length;
+      const isGroupItself = stack[stack.length - 1] === 'grpSp';
+      if (groupsBelow - (isGroupItself ? 1 : 0) === 0) {
+        edits.push({
+          start: m.index,
+          end: m.index + tag.length,
+          text: scaleBlock(tag),
+        });
+      }
+    } else if (tag.startsWith('</')) {
+      stack.pop();
+    } else {
+      stack.push(m[1]);
+    }
+  }
+
+  let out = xml;
+  for (let i = edits.length - 1; i >= 0; i--) {
+    out =
+      out.slice(0, edits[i].start) + edits[i].text + out.slice(edits[i].end);
+  }
+  return out;
+}
+
+/**
+ * Read each deck's slide size without merging — lets the UI offer the
+ * "scale to fit" toggle only when the sizes actually differ.
+ */
+export async function readSlideSizes(
+  inputs: MergeInput[]
+): Promise<Array<{ name: string; cx: number; cy: number }>> {
+  const out: Array<{ name: string; cx: number; cy: number }> = [];
+  for (const f of inputs) {
+    const u8 =
+      f.buffer instanceof Uint8Array
+        ? f.buffer
+        : new Uint8Array(f.buffer as ArrayBuffer);
+    const zip = await JSZip.loadAsync(u8);
+    const pres = zip.file('ppt/presentation.xml');
+    if (!pres) continue;
+    const xml = await pres.async('string');
+    const m = xml.match(/<p:sldSz[^>]*>/);
+    if (!m) continue;
+    out.push({
+      name: f.name,
+      cx: Number(m[0].match(/cx="(\d+)"/)?.[1] ?? 0),
+      cy: Number(m[0].match(/cy="(\d+)"/)?.[1] ?? 0),
+    });
+  }
+  return out;
 }
 
 export function formatBytes(n: number): string {
