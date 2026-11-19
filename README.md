@@ -66,9 +66,9 @@ Covers both merge modes end-to-end plus the error branches (encrypted/OLE files,
 
 ## Benchmark data
 
-We compressed 20 decks with the compressor above and published every number — including the runs where it barely helps: [`data/compress-benchmark-20files.csv`](data/compress-benchmark-20files.csv).
+We ran 16 decks through 20 measured runs with the compressor above and published every number — including the runs where it barely helps: [`data/compress-benchmark-v1.csv`](data/compress-benchmark-v1.csv).
 
-Across the 17 first-pass decks on the default Balanced setting: **322.6 MB → 34.8 MB total (−89%), median −88% per deck.** Screenshot/PNG decks came down 93–96%, BMP/TIFF scans 91–94%, photo decks 57–96% depending on how efficient the JPEGs already were.
+Across the 17 first-pass runs on the default Balanced setting: **322.6 MB → 34.8 MB total (−89%), median −88% per run.** Screenshot/PNG decks came down 93–96%, BMP/TIFF scans 91–94%, photo decks 57–96% depending on how efficient the JPEGs already were.
 
 Full write-up with methodology: **https://aippt.org/benchmark**
 
